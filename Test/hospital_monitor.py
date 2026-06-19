@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import threading
 import time  # Thu vien dinh thoi phan cung
-import sys
 from bleak import BleakClient, BleakScanner
 
 # Dinh nghia cau hinh chinh xac UUID cua Characteristic TX ben phia ESP32
@@ -23,35 +22,24 @@ PKT_FOOTER = 0x55
 
 # Bo dem vong (Dequeue) luu tru mau du lieu de ve do thi (gioi han toi da 1000 mau tren man hinh)
 MAX_SAMPLES_DISPLAY = 1000
-pcg_queue = collections.deque(maxlen=MAX_SAMPLES_DISPLAY)
-ppg_queue = collections.deque(maxlen=MAX_SAMPLES_DISPLAY)
-ecg_queue = collections.deque(maxlen=MAX_SAMPLES_DISPLAY)
+pcg_data = [None] * MAX_SAMPLES_DISPLAY
+ppg_data = [None] * MAX_SAMPLES_DISPLAY
+ecg_data = [None] * MAX_SAMPLES_DISPLAY
 
-# Khoi tao mang trong ban dau de do thi khong bi loi khi chua co data 
-pcg_queue.extend([0] * MAX_SAMPLES_DISPLAY)
-ppg_queue.extend([0] * MAX_SAMPLES_DISPLAY)
-ecg_queue.extend([0] * MAX_SAMPLES_DISPLAY)
+# Chi so con tro cua thanh quet (Chay tu 0 den 999 roi reset)
+sweep_index = 0
 
 # Bien dem debug so packet block
 audio_counter = 0
 bio_counter = 0
 last_report_time = time.perf_counter()
 
-# Co hieu dieu phoi da thread theo thoi gian thuc
-is_paused = False  # Co tam dung do thi
-ble_client_shared = None # Con tro chia se doi tuong BleakClient cheo Thread
-main_async_loop = None   # Neo giu loop asyncio de nem lenh huy tu Thread ngoai
-
 def notification_handler(sender: int, data: bytearray):
     """
     Ham callback xu ly bat dong bo khi bat duoc 1 goi byte tu Anten phat sang
     Cau hinh packet: Header (6 bytes) + Payload + Footer (3 bytes)
     """
-    global audio_counter, bio_counter, is_paused
-
-    # Neu do thi dang nhan tam dung, ta bo qua khong xu ly nhoi data de giu nguyen khung hinh
-    if is_paused:
-        return
+    global audio_counter, bio_counter
 
     if len(data) < 9: # Goi tin toi thieu phai chua Header (6B) va Footer (3B)
         return
@@ -88,7 +76,6 @@ def notification_handler(sender: int, data: bytearray):
             pcg_queue.extend(samples_pcg)
         except Exception as e:
             print(f"Audio Packet parse failed: {e} | Payload_len: {payload_len}")
-            pass
 
     # -----------  BIO PARSER ----------- 
     elif pkt_type == PKT_TYPE_BIO:
@@ -114,7 +101,6 @@ def notification_handler(sender: int, data: bytearray):
         
         except Exception as e:
             print(f"Bio Packet parse failed: {e} | Payload_len: {payload_len}")
-            pass
 
 async def monitor_performance():
     """
@@ -129,7 +115,7 @@ async def monitor_performance():
         current_time = time.perf_counter()
         elapsed_time = current_time - last_report_time
 
-        if elapsed_time > 0 and not is_paused:
+        if elapsed_time > 0:
             normalized_audio = round(audio_counter / elapsed_time)
             normalized_bio = round(bio_counter / elapsed_time)
             print(f"[BLE Central Monitor] -> Audio_block: {normalized_audio}/s, | Bio_block: {normalized_bio}/s")
@@ -140,7 +126,7 @@ async def monitor_performance():
         last_report_time = current_time
 
 async def run_ble_client():
-    global last_report_time, ble_client_shared
+    global last_report_time
 
     print("[Python BLE Central] Scanning for target device...")
     device = await BleakScanner.find_device_by_filter(
@@ -157,13 +143,10 @@ async def run_ble_client():
         # Thu vien bleak se tu dong toi uu hoa MTU cao nhat dua tren OS
         print(f"[BLE Central Monitor] Connected to Peripheral ! Now Central is Client (MTU: {client.mtu_size} bytes)")
 
-        # Ghim doi tuong client ra bien toan cuc de Thread do thi co quyen truy cap goi lenh dong ket noi
-        ble_client_shared = client
-
         print(f"[BLE Central Monitor] Activating subcribe CCCD to get Notify...")
         await client.start_notify(CHARACTERISTIC_UUID, notification_handler)
 
-        print("[BLE Central Monitor] System OK ! Receiving data...Press 'Space' to Pause, 'Q' to Disconnect & EXIT")
+        print("[BLE Central Monitor] System OK ! Receiving data...")
 
         # Ghim moc thoi gian goc ngay truoc khi kich hoat luong in
         last_report_time = time.perf_counter() 
@@ -177,40 +160,11 @@ async def run_ble_client():
 
 def start_async_background_loop(loop):
     asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_ble_client())
-    except asyncio.CancelledError:
-        pass
-
-def on_key_press(event):
-    global is_paused, ble_client_shared, main_async_loop
-    sys.stdout.flush()
-
-    # 1. Catch phim Space: Tam dung/Chay tiep do thi
-    if event.key == ' ':
-        is_paused = not is_paused
-        if is_paused:
-            print("\n Graph stopped on Screen")
-        else:
-            print("\n Graph conitinued to stream data...")
-
-    # 2. Catch phim Q: Ngat ket noi Bluetooth chu dong va thoat an toan
-    elif event.key in ['q', 'Q']:
-        print("\n Central initiative to disconnect to Peripheral...")
-
-        if ble_client_shared and ble_client_shared.is_connected:
-            # Truyen lenh huy cheo Thread an toan vao Event Loop de ep Bleak giai phong lien ket Link Layer
-            asyncio.run_coroutine_threadsafe(ble_client_shared.disconnect(), main_async_loop)
-        
-        # Tat man hinh Matplotlib va giai phong man hinh
-        plt.close('all')
+    loop.run_until_complete(run_ble_client())
 
 # ======= Khoi tao khung do thi de ve do thi cho 3 kenh =======
 fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 8))
 fig.suptitle("Real-time Cardiovascular Waveform Monitoring", fontsize=14, fontweight='bold')
-
-# Ket noi bo gac cong su kien ban phim cua Matplotlib vao cua so do thi GUI
-fig.canvas.mpl_connect('key_press_event', on_key_press)
 
 # Kenh 1: PCG - Rut tu goi Audio
 line_pcg, = ax1.plot(range(MAX_SAMPLES_DISPLAY), pcg_queue, color='teal', lw=1.0)
@@ -233,53 +187,29 @@ ax3.set_xlim(0, MAX_SAMPLES_DISPLAY)
 ax3.set_ylim(0, 3500)
 ax3.grid(True, linestyle="--", alpha=0.5)
 
-def update_graph(frame):    
+def update_graph(frame):
     """ Cap nhat giao dien do hoa cuon cho do thi """
-
-    global is_paused
-    if is_paused:
-        return line_pcg, line_ppg, line_ecg
-
     list_pcg = list(pcg_queue)
     list_ppg = list(ppg_queue)
     list_ecg = list(ecg_queue)
 
-    line_pcg.set_ydata(list(pcg_queue))
-    line_ppg.set_ydata(list(ppg_queue))
-    line_ecg.set_ydata(list(ecg_queue))
+    line_pcg.set_ydata(list_pcg)
+    line_ppg.set_ydata(list_ppg)
+    line_ecg.set_ydata(list_ecg)
 
-    # Kiem tra bien dong mang PPG hien tai de tu dong nan khit truc Y
+    # Kiem tra bien dong mang PPG hien tai de tu dong nan khit truc Y theo nhip mach dap 
     p_min, p_max = min(list_ppg), max(list_ppg)
     if p_max > p_min:
         ax2.set_ylim(p_min - 10, p_max + 10)
         
-    # Kiem tra bien dong mang PCG hien tai de tu dong nan khit truc Y
-    c_min, c_max = min(list_pcg), max(list_pcg)
-    if c_max > c_min:
-        # Tinh toan khoang dem an toan bang 10% dai bien do dong hien tai
-        c_margin = int((c_max - c_min) * 0.1) if (c_max - c_min) > 10 else 100
-        ax1.set_ylim(c_min - c_margin, c_max + c_margin)
-
-    # Kiem tra bien dong mang ECG hien tai de tu dong nan khit truc Y
-    e_min, e_max = min(list_ecg), max(list_ecg)
-    if e_max > e_min:
-        # Noi long bien do khong 20 don vi de hien thi dinh song nhon R va T can doi nhat
-        ax3.set_ylim(e_min - 20, e_max + 20)
-
     return line_pcg, line_ppg, line_ecg
 
 if __name__ == "__main__":
-    main_async_loop = asyncio.new_event_loop()
-
-    # Luong 1: BLE nhan du lieu tu ESP32
-    t_ble = threading.Thread(target=start_async_background_loop, args=(main_async_loop,), daemon=True)
-    t_ble.start()
+    bg_loop = asyncio.new_event_loop()
+    t = threading.Thread(target=start_async_background_loop, args=(bg_loop,), daemon=True)
+    t.start()
 
     # Tan suat lat khung man hinh 20ms
-    # Khi blit=False, Matplotlib bat render lai toan bo truc Y nen lag hon
-    # Khi blit=True, thu vien se ve cac thanh phan tinh (truc toa do, tieu de, luoi,...) vao 1 background
-    # duy nhat tu lan dau tien. Nhung frame tiep theo, no chi ve chong nhung thanh phan co su thay doi len
-    ani = animation.FuncAnimation(fig, update_graph, interval=20, blit=True, cache_frame_data=False)
+    ani = animation.FuncAnimation(fig, update_graph, interval=20, blit=True)
     plt.tight_layout()
     plt.show()
-    print("Stopped.")
